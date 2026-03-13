@@ -17,7 +17,12 @@ const server = http.createServer(app);
 
 app.use(express.json());
 
-// Endpoint REST para enviar comandos desde una UI o curl
+// ── Estado global (se mantiene en memoria) ─────────────────
+const estadoRelays = {};   // { relay1: 1, relay2: 0 }
+const estadoPines  = {};   // { 5: 1, 6: 0, 7: 0, 8: 1 }
+
+// ── Endpoints REST ─────────────────────────────────────────
+
 // POST /cmd   body: { "cmd": "relay1", "state": 1 }
 // POST /cmd   body: { "pin": 7,        "state": 0 }
 app.post('/cmd', (req, res) => {
@@ -27,35 +32,42 @@ app.post('/cmd', (req, res) => {
     return res.status(400).json({ error: 'Falta el campo state' });
   }
 
-  const payload = JSON.stringify({ type: 'cmd', cmd, pin, state });
-  broadcast(payload, 'esp32');  // Enviar sólo al ESP32
+  // Guardar estado en memoria
+  if (cmd !== undefined) estadoRelays[cmd] = state;
+  if (pin !== undefined) estadoPines[pin]  = state;
 
-  console.log(`[REST→WS] Comando enviado: ${payload}`);
+  const payload = JSON.stringify({ type: 'cmd', cmd, pin, state });
+
+  broadcast(payload, 'esp32');      // comando al ESP32
+  broadcast(payload, 'dashboard');  // ← sincronizar todos los dashboards
+
+  timestamp(`[REST→WS] Comando: ${payload}`);
   res.json({ ok: true, payload });
 });
 
-// Endpoint de estado simple
+// GET /status — clientes conectados
 app.get('/status', (_req, res) => {
   const clientes = [...clienteMap.values()].map(({ device, ip }) => ({ device, ip }));
   res.json({ clientes, total: clienteMap.size });
 });
 
-// ── WebSocket Server ───────────────────────────────────────
-const wss = new WebSocketServer({ server });
+// GET /state — estado actual de relays y pines
+// Útil para que un dashboard nuevo se sincronice al conectarse
+app.get('/state', (_req, res) => {
+  res.json({ relays: estadoRelays, pins: estadoPines });
+});
 
-// Map<WebSocket, {device, ip}> — registro de clientes conectados
+// ── WebSocket Server ───────────────────────────────────────
+const wss       = new WebSocketServer({ server });
 const clienteMap = new Map();
 
 wss.on('connection', (ws, req) => {
   const ip = req.socket.remoteAddress;
   clienteMap.set(ws, { device: 'unknown', ip });
-
   timestamp(`Cliente conectado desde ${ip}. Total: ${wss.clients.size}`);
 
-  // ── Evento: mensaje recibido ──────────────────────────────
   ws.on('message', (rawData) => {
     let data;
-
     try {
       data = JSON.parse(rawData.toString());
     } catch (e) {
@@ -63,21 +75,28 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
-    const tipo = data.type;
+    switch (data.type) {
 
-    switch (tipo) {
-
-      // Registro del dispositivo al conectarse
       case 'register': {
         const device = data.device || 'unknown';
         clienteMap.set(ws, { device, ip });
         timestamp(`Dispositivo registrado: ${device} (${ip})`);
-        // Confirmar al cliente
+
+        // Confirmar registro
         enviar(ws, { type: 'ack', msg: `Bienvenido, ${device}` });
+
+        // Si es un dashboard, enviarle el estado actual para sincronizar
+        if (device === 'dashboard') {
+          enviar(ws, {
+            type:   'state_sync',
+            relays: estadoRelays,
+            pins:   estadoPines,
+          });
+          timestamp(`[SYNC] Estado enviado a nuevo dashboard (${ip})`);
+        }
         break;
       }
 
-      // Datos de sensores del ESP32/Arduino
       case 'sensor_data': {
         const { sensors, uptime_ms } = data;
         timestamp(
@@ -86,24 +105,20 @@ wss.on('connection', (ws, req) => {
           `D2=${sensors.digital2} D3=${sensors.digital3} ` +
           `| uptime=${uptime_ms}ms`
         );
-
-        // Reenviar a todos los clientes dashboard (no esp32)
         broadcast(JSON.stringify(data), 'dashboard');
         break;
       }
 
-      // Keep-alive del ESP32
       case 'ping':
         enviar(ws, { type: 'pong' });
         break;
 
       default:
-        console.log(`[WS] Tipo desconocido: ${tipo}`);
+        console.log(`[WS] Tipo desconocido: ${data.type}`);
     }
   });
 
-  // ── Evento: desconexión ───────────────────────────────────
-  ws.on('close', (code, reason) => {
+  ws.on('close', (code) => {
     const info = clienteMap.get(ws) || {};
     timestamp(`Desconectado: ${info.device || 'unknown'} (${info.ip}) — código ${code}`);
     clienteMap.delete(ws);
@@ -115,20 +130,12 @@ wss.on('connection', (ws, req) => {
 });
 
 // ── Helpers ────────────────────────────────────────────────
-
-/**
- * Envía un objeto JSON a un cliente específico.
- */
 function enviar(ws, obj) {
   if (ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(obj));
   }
 }
 
-/**
- * Envía un mensaje a todos los clientes de un rol determinado.
- * targetDevice: 'esp32' | 'dashboard' | '*'
- */
 function broadcast(payload, targetDevice = '*') {
   for (const [ws, info] of clienteMap.entries()) {
     if (ws.readyState !== WebSocket.OPEN) continue;
@@ -137,12 +144,8 @@ function broadcast(payload, targetDevice = '*') {
   }
 }
 
-/**
- * Log con timestamp ISO.
- */
 function timestamp(msg) {
-  const ts = new Date().toISOString();
-  console.log(`[${ts}] ${msg}`);
+  console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
 // ── Arrancar servidor ──────────────────────────────────────
@@ -150,7 +153,9 @@ server.listen(PORT, () => {
   timestamp(`Servidor escuchando en http://localhost:${PORT}`);
   timestamp(`WebSocket disponible en ws://localhost:${PORT}`);
   console.log('──────────────────────────────────────────────');
-  console.log('  POST /cmd   {"cmd":"relay1","state":1}');
+  console.log('  POST /cmd    {"cmd":"relay1","state":1}');
+  console.log('  POST /cmd    {"pin":7,"state":0}');
   console.log('  GET  /status');
+  console.log('  GET  /state');
   console.log('──────────────────────────────────────────────');
 });
